@@ -1,24 +1,26 @@
 /* =============================================================
-   TrustBridge Auth  —  API-backed (works on ALL devices)
+   TrustBridge Auth  —  Client-side only (no backend required)
+   Accounts live in localStorage. They persist on the same
+   device/browser. No server needed.
    ============================================================= */
 (function () {
 
-  // Token lives in localStorage — it's just a random string, not sensitive
+  function getUsers()       { try { return JSON.parse(localStorage.getItem('tb_users') || '{}'); } catch { return {}; } }
+  function saveUsers(u)     { try { localStorage.setItem('tb_users', JSON.stringify(u)); } catch {} }
   function getToken()       { try { return localStorage.getItem('tb_token') || null; } catch { return null; } }
   function setToken(t)      { try { t ? localStorage.setItem('tb_token', t) : localStorage.removeItem('tb_token'); } catch {} }
   function getStoredUser()  { try { return JSON.parse(localStorage.getItem('tb_user') || 'null'); } catch { return null; } }
   function setStoredUser(u) { try { u ? localStorage.setItem('tb_user', JSON.stringify(u)) : localStorage.removeItem('tb_user'); } catch {} }
 
-  async function api(endpoint, options) {
-    const token = getToken();
-    const headers = { 'Content-Type': 'application/json' };
-    if (token) headers['Authorization'] = 'Bearer ' + token;
-    try {
-      const res = await fetch('/api' + endpoint, { headers, ...options });
-      return await res.json();
-    } catch {
-      return { ok: false, err: 'Network error. Please check your connection.' };
-    }
+  function hashPassword(pw) {
+    let hash = 0;
+    const str = pw + 'tb_salt_2025';
+    for (let i = 0; i < str.length; i++) { hash = ((hash << 5) - hash) + str.charCodeAt(i); hash |= 0; }
+    return hash.toString(36);
+  }
+
+  function makeToken() {
+    return Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
   }
 
   window.TBAuth = {
@@ -26,38 +28,51 @@
     getUser()    { return getStoredUser(); },
 
     async register(username, password) {
-      const r = await api('/register', { method: 'POST', body: JSON.stringify({ username, password }) });
-      if (r.ok) { setToken(r.token); setStoredUser(r.user); }
-      return r;
+      if (!username || !password) return { ok: false, err: 'Both fields are required.' };
+      username = username.trim();
+      if (!/^[a-zA-Z0-9_]{3,20}$/.test(username))
+        return { ok: false, err: 'Username must be 3-20 characters (letters, numbers, underscores only).' };
+      if (password.length < 6)
+        return { ok: false, err: 'Password must be at least 6 characters.' };
+      const users = getUsers();
+      const taken = Object.values(users).some(u => u.username.toLowerCase() === username.toLowerCase());
+      if (taken) return { ok: false, err: 'Username already taken.' };
+      const id = 'u_' + Date.now();
+      const token = makeToken();
+      users[id] = { id, username, password: hashPassword(password), token };
+      saveUsers(users);
+      setToken(token); setStoredUser({ id, username });
+      return { ok: true, user: { id, username }, token };
     },
 
     async login(username, password) {
-      const r = await api('/login', { method: 'POST', body: JSON.stringify({ username, password }) });
-      if (r.ok) { setToken(r.token); setStoredUser(r.user); }
-      return r;
+      if (!username || !password) return { ok: false, err: 'Please enter your credentials.' };
+      username = username.trim().toLowerCase();
+      const users = getUsers();
+      const found = Object.values(users).find(
+        u => u.username.toLowerCase() === username && u.password === hashPassword(password)
+      );
+      if (!found) return { ok: false, err: 'Incorrect username or password.' };
+      const token = makeToken();
+      users[found.id].token = token;
+      saveUsers(users);
+      setToken(token); setStoredUser({ id: found.id, username: found.username });
+      return { ok: true, user: { id: found.id, username: found.username }, token };
     },
 
     async logout() {
-      try { await api('/logout', { method: 'POST' }); } catch {}
       setToken(null); setStoredUser(null);
     },
 
-    async saveTransaction(txId, txData) {
-      if (!this.isLoggedIn()) return;
-      await api('/transactions', { method: 'POST', body: JSON.stringify({ txId, txData }) });
-    },
-
-    async getTransactions() {
-      if (!this.isLoggedIn()) return [];
-      const r = await api('/transactions');
-      return r.ok ? r.transactions : [];
-    },
+    // No-ops in static mode
+    async saveTransaction() {},
+    async getTransactions() { return []; },
 
     async verifySession() {
-      if (!getToken()) return false;
-      const r = await api('/me');
-      if (!r.ok) { setToken(null); setStoredUser(null); return false; }
-      setStoredUser(r.user);
+      const token = getToken(); const user = getStoredUser();
+      if (!token || !user) return false;
+      const users = getUsers(); const found = users[user.id];
+      if (!found || found.token !== token) { setToken(null); setStoredUser(null); return false; }
       return true;
     }
   };
@@ -78,7 +93,6 @@
         <span style="font-family:'Playfair Display',serif;font-size:1.3rem;font-weight:700;color:#0d2b52;">Trust<span style="color:#0ea8a8;">Bridge</span></span>
       </div>
       <div id="tb-auth-error" style="display:none;background:#fff5f5;border:1px solid #feb2b2;border-radius:8px;padding:0.65rem 1rem;margin-bottom:1rem;font-size:0.83rem;color:#c53030;"></div>
-      <div id="tb-auth-loading" style="display:none;text-align:center;padding:0.5rem;font-size:0.85rem;color:#8a99b3;font-family:'DM Sans',sans-serif;">Connecting...</div>
 
       <div id="tb-form-login">
         <div style="margin-bottom:1rem;">
@@ -122,16 +136,11 @@
       this._requireAuth = options.requireAuth || false;
       this._onLogin     = options.onLogin || null;
 
-      // Verify existing session with server
       if (TBAuth.isLoggedIn()) {
         const valid = await TBAuth.verifySession();
-        if (!valid && this._requireAuth) {
-          this.openModal('login');
-          return;
-        }
+        if (!valid && this._requireAuth) { this.openModal('login'); return; }
       } else if (this._requireAuth) {
-        this.openModal('login');
-        return;
+        this.openModal('login'); return;
       }
 
       this.renderNavButton();
@@ -157,10 +166,8 @@
       overlay.style.display = 'flex';
       this.showTab(tab || 'login');
       this.clearError();
-      // Clear all fields every time modal opens
       ['tb-login-username','tb-login-password','tb-reg-username','tb-reg-password'].forEach(id => {
-        const el = document.getElementById(id);
-        if (el) el.value = '';
+        const el = document.getElementById(id); if (el) el.value = '';
       });
       document.body.style.overflow = 'hidden';
       overlay.onclick = (e) => { if (e.target === overlay && !this._requireAuth) this.closeModal(); };
@@ -188,29 +195,17 @@
       }
     },
 
-    showError(msg) {
-      const el = document.getElementById('tb-auth-error');
-      el.textContent = msg; el.style.display = 'block';
-    },
-    clearError() {
-      const el = document.getElementById('tb-auth-error');
-      if (el) { el.textContent = ''; el.style.display = 'none'; }
-    },
-    setLoading(on) {
-      const el = document.getElementById('tb-auth-loading');
-      if (el) el.style.display = on ? 'block' : 'none';
-    },
+    showError(msg) { const el = document.getElementById('tb-auth-error'); el.textContent = msg; el.style.display = 'block'; },
+    clearError()   { const el = document.getElementById('tb-auth-error'); if (el) { el.textContent = ''; el.style.display = 'none'; } },
 
     async submitLogin() {
       const username = document.getElementById('tb-login-username').value.trim();
       const password = document.getElementById('tb-login-password').value;
       if (!username || !password) { this.showError('Please fill in all fields.'); return; }
-      this.clearError(); this.setLoading(true);
+      this.clearError();
       const result = await TBAuth.login(username, password);
-      this.setLoading(false);
       if (!result.ok) { this.showError(result.err); return; }
-      this.closeModal();
-      this.renderNavButton();
+      this.closeModal(); this.renderNavButton();
       if (this._onLogin) this._onLogin(result.user);
     },
 
@@ -218,12 +213,10 @@
       const username = document.getElementById('tb-reg-username').value.trim();
       const password = document.getElementById('tb-reg-password').value;
       if (!username || !password) { this.showError('Please fill in all fields.'); return; }
-      this.clearError(); this.setLoading(true);
+      this.clearError();
       const result = await TBAuth.register(username, password);
-      this.setLoading(false);
       if (!result.ok) { this.showError(result.err); return; }
-      this.closeModal();
-      this.renderNavButton();
+      this.closeModal(); this.renderNavButton();
       if (this._onLogin) this._onLogin(result.user);
     },
 
